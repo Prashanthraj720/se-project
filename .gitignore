@@ -1,1 +1,4 @@
 
+hmms.db
+hmms_backup_*.db
+__pycache__/
