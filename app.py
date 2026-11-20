@@ -493,7 +493,7 @@ def student_billing_tab(user):
     st.subheader("Payment history")
     show_table(fetch_all(
         "SELECT p.payment_date AS Date, b.month AS Month, p.amount AS Amount, "
-        "p.transaction_id AS Transaction, p.status AS Status "
+        "p.transaction_id AS Txn_ID, p.status AS Status "
         "FROM payment p JOIN bill b ON b.bill_id = p.bill_id "
         "WHERE p.student_id = ? ORDER BY p.payment_id DESC", (user["user_id"],)), "No payments yet.")
 
