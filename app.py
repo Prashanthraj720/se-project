@@ -2,7 +2,7 @@
 import hashlib
 import os
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -14,6 +14,7 @@ ROLES = ["Student", "Mess Staff", "Warden", "Admin"]
 MEAL_TYPES = ["Breakfast", "Lunch", "Dinner"]
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 COMPLAINT_STATUSES = ["Pending", "In Progress", "Resolved"]
+LEAVE_STATUSES = ["Pending", "Approved", "Rejected"]
 PAYMENT_METHODS = ["UPI", "Credit/Debit Card", "Net Banking"]
 DEFAULT_SETTINGS = {
     "meal_rate": "50",
@@ -105,6 +106,14 @@ CREATE TABLE IF NOT EXISTS feedback (
     rating INTEGER,
     date TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS leave_request (
+    leave_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id INTEGER NOT NULL REFERENCES users(user_id),
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'Pending'
+);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -133,30 +142,39 @@ SELECT item_name AS Item, quantity AS Quantity, unit AS Unit, price AS Price,
 FROM inventory ORDER BY item_name
 """
 
+# Clean, minimal light look: white page, hairline borders, one dark accent, no shadows.
 APP_CSS = """
 <style>
-.stApp { background: #f3f6fb; }
-.block-container { padding-top: 2rem; max-width: 1100px; }
-h1, h2, h3 { color: #1f3a5f; font-weight: 600; }
+#MainMenu, footer { visibility: hidden; }
+.stApp { background: #ffffff; color: #1f2937; }
+.block-container { padding-top: 2.5rem; max-width: 1040px; }
+h1, h2, h3 { color: #111827; font-weight: 600; letter-spacing: -0.01em; }
+h2 { font-size: 1.6rem; }
+h3 { font-size: 1.1rem; margin-top: 1.2rem; }
+section[data-testid="stSidebar"] { background: #f8fafc; border-right: 1px solid #e5e7eb; }
 div[data-testid="stForm"] {
-    background: #ffffff; border: 1px solid #e3e9f2; border-radius: 14px;
-    padding: 1.2rem 1.4rem; box-shadow: 0 4px 14px rgba(31, 58, 95, 0.08);
+    background: #ffffff; border: 1px solid #e5e7eb; border-radius: 10px;
+    padding: 1rem 1.2rem; box-shadow: none;
 }
 .stButton > button, .stFormSubmitButton > button, .stDownloadButton > button,
 button[data-testid="stBaseButton-secondary"], button[data-testid="stBaseButton-secondaryFormSubmit"] {
-    background: #2f6fda; color: #ffffff; border: none; border-radius: 8px; padding: 0.5rem 1.2rem;
+    background: #111827; color: #ffffff; border: 1px solid #111827; border-radius: 8px;
+    padding: 0.45rem 1.1rem; font-weight: 500;
 }
+.stButton > button p, .stFormSubmitButton > button p, .stDownloadButton > button p { color: #ffffff; }
 .stButton > button:hover, .stFormSubmitButton > button:hover, .stDownloadButton > button:hover {
-    background: #2459b3; color: #ffffff;
+    background: #374151; border-color: #374151; color: #ffffff;
 }
 div[data-testid="stMetric"] {
-    background: #ffffff; border-left: 5px solid #2f6fda; border-radius: 12px;
-    padding: 14px 18px; box-shadow: 0 2px 10px rgba(31, 58, 95, 0.08);
+    background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px 16px;
 }
+div[data-testid="stMetricLabel"] { color: #6b7280; }
+button[data-baseweb="tab"] { font-weight: 500; }
 .stTable td, .stTable th { padding: 0.6rem 0.9rem; }
-.login-title { text-align: center; font-size: 1.9rem; font-weight: 700; color: #1f3a5f; margin: 2rem 0 1rem; }
-.hint { text-align: center; font-size: 0.85rem; color: #5b6b82; margin-top: 0.8rem; }
-@media (max-width: 640px) { .login-title { font-size: 1.4rem; } }
+.login-title { text-align: center; font-size: 1.7rem; font-weight: 700; color: #111827; margin: 2.5rem 0 0.3rem; }
+.login-sub { text-align: center; color: #6b7280; margin-bottom: 1.2rem; }
+.hint { text-align: center; font-size: 0.82rem; color: #6b7280; margin-top: 0.9rem; }
+@media (max-width: 640px) { .login-title { font-size: 1.35rem; } }
 </style>
 """
 
@@ -271,6 +289,15 @@ def get_meal_rate():
         return float(DEFAULT_SETTINGS["meal_rate"])
 
 
+def is_on_leave(student_id, day):
+    """True when the student has an approved leave covering the given ISO date."""
+    return count_rows(
+        "SELECT COUNT(*) FROM leave_request "
+        "WHERE student_id = ? AND status = 'Approved' AND ? BETWEEN start_date AND end_date",
+        (student_id, day),
+    ) > 0
+
+
 def build_bill_statements(student_id, month):
     """Writes that create or refresh a month's bill from verified meals (paid bills stay untouched)."""
     meals = count_rows(
@@ -358,6 +385,20 @@ def show_report(title, rows, key):
                        file_name=f"{key}.csv", mime="text/csv", key=f"download_{key}")
 
 
+def render_metrics(metrics):
+    """Show (label, value) pairs as a row of metric cards."""
+    for column, (label, value) in zip(st.columns(len(metrics)), metrics):
+        column.metric(label, value)
+
+
+def render_bar_chart(title, rows, label_column, empty_text):
+    st.subheader(title)
+    if not rows:
+        st.info(empty_text)
+        return
+    st.bar_chart(rows_to_df(rows).set_index(label_column))
+
+
 def pick_row(label, rows, id_column, describe, key, empty_text="Nothing to choose from yet."):
     """Selectbox over database rows; returns the chosen row, or None if there are no rows."""
     if not rows:
@@ -393,7 +434,8 @@ def reports_section(prefix):
 def login_page():
     _, centre, _ = st.columns([1, 1.4, 1])
     with centre:
-        st.markdown('<div class="login-title">Hostel Mess Management System</div>', unsafe_allow_html=True)
+        st.markdown('<div class="login-title">Hostel Mess Management System</div>'
+                    '<div class="login-sub">Sign in to continue</div>', unsafe_allow_html=True)
         with st.form("login_form"):
             username = st.text_input("Username", key="login_username")
             password = st.text_input("Password", type="password", key="login_password")
@@ -416,6 +458,15 @@ def login_page():
 
 
 # ------------------------------------------------------------- student pages
+def render_today_menu():
+    today_name = DAYS[date.today().weekday()]
+    st.subheader(f"Today's menu - {today_name}")
+    items_by_meal = {row["meal_type"]: row["items"]
+                     for row in fetch_all("SELECT meal_type, items FROM menu WHERE day = ?", (today_name,))}
+    show_table([{"Meal": meal, "Items": items_by_meal.get(meal, "-"), "Timing": get_setting(f"time_{meal}")}
+                for meal in MEAL_TYPES])
+
+
 def render_menu_and_timetable():
     st.subheader("Weekly menu")
     grid = {day: {meal: "-" for meal in MEAL_TYPES} for day in DAYS}
@@ -426,6 +477,19 @@ def render_menu_and_timetable():
     st.subheader("Mess timetable")
     timetable = [{"Meal": meal, "Timing": get_setting(f"time_{meal}")} for meal in MEAL_TYPES]
     st.dataframe(pd.DataFrame(timetable), hide_index=True)
+
+
+def student_home_tab(user):
+    month_prefix = f"{date.today():%Y-%m}%"
+    verified = count_rows("SELECT COUNT(*) FROM meal_record WHERE student_id = ? AND verified = 1 AND date LIKE ?",
+                          (user["user_id"], month_prefix))
+    waiting = count_rows("SELECT COUNT(*) FROM meal_record WHERE student_id = ? AND verified = 0 AND date LIKE ?",
+                         (user["user_id"], month_prefix))
+    due = fetch_one("SELECT COALESCE(SUM(total_amount), 0) FROM bill WHERE student_id = ? AND status = 'Unpaid'",
+                    (user["user_id"],))[0]
+    render_metrics([("Verified meals this month", verified), ("Awaiting verification", waiting),
+                    ("Amount due", f"₹{due:.2f}")])
+    render_today_menu()
 
 
 def student_attendance_tab(user):
@@ -439,7 +503,9 @@ def student_attendance_tab(user):
             "SELECT 1 FROM meal_record WHERE student_id = ? AND date = ? AND meal_type = ?",
             (user["user_id"], today, meal),
         )
-        if already:
+        if is_on_leave(user["user_id"], today):
+            st.warning("You have approved leave today, so attendance cannot be marked.")
+        elif already:
             st.warning(f"You have already marked {meal} for today.")
         else:
             save([("INSERT INTO meal_record (student_id, date, meal_type, status) VALUES (?, ?, ?, 'Present')",
@@ -491,11 +557,35 @@ def student_billing_tab(user):
             ], f"Payment of ₹{bill['total_amount']:.2f} via {method} successful. Transaction ID: {transaction_id}")
 
     st.subheader("Payment history")
+    # "Transaction" is a reserved word in SQLite, so the alias is Txn_ID.
     show_table(fetch_all(
         "SELECT p.payment_date AS Date, b.month AS Month, p.amount AS Amount, "
         "p.transaction_id AS Txn_ID, p.status AS Status "
         "FROM payment p JOIN bill b ON b.bill_id = p.bill_id "
         "WHERE p.student_id = ? ORDER BY p.payment_id DESC", (user["user_id"],)), "No payments yet.")
+
+
+def student_leave_tab(user):
+    st.subheader("Request meal leave")
+    st.caption("While a leave is approved, attendance cannot be marked for those dates.")
+    with st.form("leave_form", clear_on_submit=True):
+        start = st.date_input("From", value=date.today(), key="leave_start")
+        end = st.date_input("To", value=date.today(), key="leave_end")
+        reason = st.text_input("Reason", key="leave_reason")
+        submitted = st.form_submit_button("Submit request")
+    if submitted:
+        if end < start:
+            st.error("The end date cannot be before the start date.")
+        elif not reason.strip():
+            st.error("Please give a short reason.")
+        else:
+            save([("INSERT INTO leave_request (student_id, start_date, end_date, reason) VALUES (?, ?, ?, ?)",
+                   (user["user_id"], start.isoformat(), end.isoformat(), reason.strip()))],
+                 "Leave request sent to the warden.")
+    show_table(fetch_all(
+        "SELECT leave_id AS ID, start_date AS From_date, end_date AS To_date, reason AS Reason, status AS Status "
+        "FROM leave_request WHERE student_id = ? ORDER BY leave_id DESC", (user["user_id"],)),
+        "You have not requested any leave.")
 
 
 def student_complaints_tab(user):
@@ -529,14 +619,18 @@ def student_complaints_tab(user):
 
 
 def student_page(user):
-    tabs = st.tabs(["Menu & Timetable", "Attendance", "Billing", "Complaints & Feedback"])
+    tabs = st.tabs(["Home", "Menu & Timetable", "Attendance", "Billing", "Leave", "Complaints & Feedback"])
     with tabs[0]:
-        render_menu_and_timetable()
+        student_home_tab(user)
     with tabs[1]:
-        student_attendance_tab(user)
+        render_menu_and_timetable()
     with tabs[2]:
-        student_billing_tab(user)
+        student_attendance_tab(user)
     with tabs[3]:
+        student_billing_tab(user)
+    with tabs[4]:
+        student_leave_tab(user)
+    with tabs[5]:
         student_complaints_tab(user)
 
 
@@ -736,26 +830,38 @@ def staff_page(user):
 # --------------------------------------------------------------- warden page
 def warden_dashboard_tab():
     today = date.today().isoformat()
-    metrics = [
+    render_metrics([
         ("Students", count_rows("SELECT COUNT(*) FROM users WHERE role = 'Student' AND active = 1")),
         ("Today's attendance", count_rows("SELECT COUNT(*) FROM meal_record WHERE date = ?", (today,))),
         ("Pending complaints", count_rows("SELECT COUNT(*) FROM complaint WHERE status = 'Pending'")),
+        ("Pending leave", count_rows("SELECT COUNT(*) FROM leave_request WHERE status = 'Pending'")),
         ("Unpaid bills", count_rows("SELECT COUNT(*) FROM bill WHERE status = 'Unpaid'")),
-    ]
-    for column, (label, value) in zip(st.columns(len(metrics)), metrics):
-        column.metric(label, value)
+    ])
     st.subheader("Today's attendance by meal")
     show_table(fetch_all("SELECT meal_type AS Meal, COUNT(*) AS Marked, SUM(verified) AS Verified "
                          "FROM meal_record WHERE date = ? GROUP BY meal_type", (today,)),
                "No attendance marked today.")
+    week_start = (date.today() - timedelta(days=6)).isoformat()
+    left, right = st.columns(2)
+    with left:
+        render_bar_chart("Meals marked - last 7 days",
+                         fetch_all("SELECT date AS Day, COUNT(*) AS Meals FROM meal_record "
+                                   "WHERE date >= ? GROUP BY date ORDER BY date", (week_start,)),
+                         "Day", "No attendance in the last 7 days.")
+    with right:
+        render_bar_chart("Complaints by status",
+                         fetch_all("SELECT status AS Status, COUNT(*) AS Total FROM complaint GROUP BY status"),
+                         "Status", "No complaints yet.")
 
 
 def warden_complaints_tab():
-    rows = fetch_all(
+    status_filter = st.selectbox("Show", ["All"] + COMPLAINT_STATUSES, key="complaint_filter")
+    rows = [row for row in fetch_all(
         "SELECT c.complaint_id, c.date, u.full_name, u.room_no, c.description, c.status "
         "FROM complaint c JOIN users u ON u.user_id = c.student_id "
         "ORDER BY CASE c.status WHEN 'Pending' THEN 0 WHEN 'In Progress' THEN 1 ELSE 2 END, c.complaint_id DESC")
-    show_table(rows, "No complaints have been registered.")
+        if status_filter == "All" or row["status"] == status_filter]
+    show_table(rows, "No complaints match this filter.")
     complaint = pick_row("Complaint to update", rows, "complaint_id",
                          lambda c: f"#{c['complaint_id']} {c['full_name']} - {c['description'][:40]} [{c['status']}]",
                          "complaint_pick", "Nothing to review right now.")
@@ -772,6 +878,28 @@ def warden_complaints_tab():
              f"Complaint #{complaint_id} marked {new_status}.")
 
 
+def warden_leave_tab():
+    rows = fetch_all(
+        "SELECT l.leave_id, u.full_name, u.room_no, l.start_date, l.end_date, l.reason, l.status "
+        "FROM leave_request l JOIN users u ON u.user_id = l.student_id "
+        "ORDER BY CASE l.status WHEN 'Pending' THEN 0 ELSE 1 END, l.leave_id DESC")
+    show_table(rows, "No leave requests yet.")
+    leave = pick_row("Request to decide", rows, "leave_id",
+                     lambda item: f"#{item['leave_id']} {item['full_name']}, {item['start_date']} to "
+                                  f"{item['end_date']} [{item['status']}]",
+                     "leave_pick", "Nothing to review right now.")
+    if leave is None:
+        return
+    leave_id = leave["leave_id"]
+    with st.form(f"leave_status_form_{leave_id}"):
+        decision = st.selectbox("Decision", LEAVE_STATUSES, index=LEAVE_STATUSES.index(leave["status"]),
+                                key=f"leave_decision_{leave_id}")
+        submitted = st.form_submit_button("Save decision")
+    if submitted:
+        save([("UPDATE leave_request SET status = ? WHERE leave_id = ?", (decision, leave_id))],
+             f"Leave request #{leave_id} marked {decision}.")
+
+
 def warden_reports_tab():
     reports_section("warden")
     st.subheader("Student feedback")
@@ -785,12 +913,14 @@ def warden_reports_tab():
 
 def warden_page(user):
     st.caption(f"Welcome, {user['full_name']}.")
-    tabs = st.tabs(["Dashboard", "Complaints", "Reports & Feedback"])
+    tabs = st.tabs(["Dashboard", "Complaints", "Leave Requests", "Reports & Feedback"])
     with tabs[0]:
         warden_dashboard_tab()
     with tabs[1]:
         warden_complaints_tab()
     with tabs[2]:
+        warden_leave_tab()
+    with tabs[3]:
         warden_reports_tab()
 
 
@@ -886,9 +1016,16 @@ def admin_delete_form(target, admin):
 
 
 def admin_users_tab(admin):
-    users = fetch_all("SELECT user_id, username, full_name, email, phone, role, room_no, active "
-                      "FROM users ORDER BY role, username")
-    show_table(users)
+    search_col, role_col = st.columns([2, 1])
+    search = search_col.text_input("Search by name or username", key="admin_user_search").strip().lower()
+    role_filter = role_col.selectbox("Role", ["All"] + ROLES, key="admin_role_filter")
+    users = [u for u in fetch_all("SELECT user_id, username, full_name, email, phone, role, room_no, active "
+                                  "FROM users ORDER BY role, username")
+             if (role_filter == "All" or u["role"] == role_filter)
+             and search in f"{u['username']} {u['full_name']}".lower()]
+    show_table([{"ID": u["user_id"], "Username": u["username"], "Name": u["full_name"], "Email": u["email"],
+                 "Phone": u["phone"], "Role": u["role"], "Room": u["room_no"],
+                 "Active": "Yes" if u["active"] else "No"} for u in users], "No users match your search.")
     target = pick_row("Select a user to edit, reset, deactivate or delete", users, "user_id",
                       lambda u: f"{u['username']} - {u['full_name']} ({u['role']})", "admin_user_pick")
     tabs = st.tabs(["Add user", "Edit", "Reset password", "Activate / deactivate", "Delete"])
@@ -946,8 +1083,31 @@ def admin_page(user):
 
 
 # ---------------------------------------------------------------------- main
+def change_password_form(user):
+    """Let any logged-in user change their own password from the sidebar."""
+    with st.sidebar.expander("Change password"):
+        with st.form("change_password_form", clear_on_submit=True):
+            current = st.text_input("Current password", type="password", key="cp_current")
+            new_password = st.text_input("New password", type="password", key="cp_new")
+            confirm = st.text_input("Confirm new password", type="password", key="cp_confirm")
+            submitted = st.form_submit_button("Update password")
+        if submitted:
+            row = fetch_one("SELECT password_hash, salt FROM users WHERE user_id = ?", (user["user_id"],))
+            if not verify_password(current, row["password_hash"], row["salt"]):
+                st.error("Current password is incorrect.")
+            elif len(new_password) < 6:
+                st.error("The new password must be at least 6 characters long.")
+            elif new_password != confirm:
+                st.error("The two new passwords do not match.")
+            else:
+                password_hash, salt = hash_password(new_password)
+                save([("UPDATE users SET password_hash = ?, salt = ? WHERE user_id = ?",
+                       (password_hash, salt, user["user_id"]))], "Your password was changed.")
+
+
 def render_sidebar(user):
     st.sidebar.markdown(f"Logged in as **{user['full_name']}** ({user['role']})")
+    change_password_form(user)
     if st.sidebar.button("Logout", key="logout_button"):
         st.session_state.clear()
         st.rerun()
